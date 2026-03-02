@@ -54,9 +54,10 @@ Modern, open-source WhatsApp Business Platform. Single binary app.
 
 ## Installation
 
-### Docker
+### Docker (Database Only)
 
 The latest image is available on Docker Hub at [`shridh0r/whatomate:latest`](https://hub.docker.com/r/shridh0r/whatomate)
+**Note**: Redis must be installed and running locally on the host machine.
 
 ```bash
 # Download compose file and sample config

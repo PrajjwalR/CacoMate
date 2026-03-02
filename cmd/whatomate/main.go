@@ -151,7 +151,7 @@ func runServer(args []string) {
 	}
 
 	// Connect to Redis
-	rdb, err := database.NewRedis(&cfg.Redis)
+	rdb, err := database.NewRedis(&cfg.Redis, lo)
 	if err != nil {
 		lo.Fatal("Failed to connect to Redis", "error", err)
 	}
@@ -343,7 +343,7 @@ func runWorker(args []string) {
 	lo.Info("Connected to PostgreSQL")
 
 	// Connect to Redis
-	rdb, err := database.NewRedis(&cfg.Redis)
+	rdb, err := database.NewRedis(&cfg.Redis, lo)
 	if err != nil {
 		lo.Fatal("Failed to connect to Redis", "error", err)
 	}

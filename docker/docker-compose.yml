@@ -11,8 +11,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      redis:
-        condition: service_healthy
     volumes:
       - ./uploads:/app/uploads:rw
       - ./config.toml:/app/config.toml:ro
@@ -39,26 +37,9 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
-  # Redis
-  redis:
-    image: redis:7-alpine
-    container_name: whatomate_redis
-    restart: unless-stopped
-    networks:
-      - whatomate
-    ports:
-      - "127.0.0.1:6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    volumes:
-      - redis-data:/data
 
 networks:
   whatomate:
 
 volumes:
   postgres-data:
-  redis-data:
