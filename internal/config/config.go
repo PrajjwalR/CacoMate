@@ -22,6 +22,7 @@ type Config struct {
 	DefaultAdmin  DefaultAdminConfig  `koanf:"default_admin"`
 	RateLimit     RateLimitConfig     `koanf:"rate_limit"`
 	Cookie        CookieConfig        `koanf:"cookie"`
+	CacoSSO       CacoSSOConfig       `koanf:"caco_sso"`
 }
 
 type AppConfig struct {
@@ -105,6 +106,11 @@ type RateLimitConfig struct {
 	SSOMaxAttempts      int  `koanf:"sso_max_attempts"`
 	WindowSeconds       int  `koanf:"window_seconds"`
 	TrustProxy          bool `koanf:"trust_proxy"`
+}
+
+// CacoSSOConfig holds configuration for cross-app SSO from caco-marketing-tool
+type CacoSSOConfig struct {
+	Secret string `koanf:"secret"` // Shared secret for signing/verifying login tokens
 }
 
 // Load loads configuration from file and environment variables

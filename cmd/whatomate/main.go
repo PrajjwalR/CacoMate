@@ -436,6 +436,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.POST("/api/auth/logout", app.Logout)
 	g.POST("/api/auth/switch-org", app.SwitchOrg)
 	g.GET("/api/auth/ws-token", app.GetWSToken)
+	g.GET("/api/auth/caco-sso", app.CacoSSO) // Cross-app SSO from caco-marketing-tool
 
 	// SSO routes (public, optionally rate-limited)
 	g.GET("/api/auth/sso/providers", app.GetPublicSSOProviders)
@@ -470,7 +471,8 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		// Skip auth for public routes
 		if path == "/health" || path == "/ready" ||
 			path == "/api/auth/login" || path == "/api/auth/register" || path == "/api/auth/refresh" ||
-			path == "/api/auth/logout" || path == "/api/webhook" || path == "/ws" {
+			path == "/api/auth/logout" || path == "/api/auth/webhook" || path == "/ws" ||
+			path == "/api/auth/caco-sso" {
 			return r
 		}
 		// Skip auth for SSO routes (they handle their own auth via state tokens)
