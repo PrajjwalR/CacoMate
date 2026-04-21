@@ -471,7 +471,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		// Skip auth for public routes
 		if path == "/health" || path == "/ready" ||
 			path == "/api/auth/login" || path == "/api/auth/register" || path == "/api/auth/refresh" ||
-			path == "/api/auth/logout" || path == "/api/auth/webhook" || path == "/ws" ||
+			path == "/api/auth/logout" || path == "/api/webhook" || path == "/ws" ||
 			path == "/api/auth/caco-sso" {
 			return r
 		}
