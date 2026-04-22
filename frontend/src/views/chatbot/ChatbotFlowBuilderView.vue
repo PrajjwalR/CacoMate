@@ -504,6 +504,43 @@ function openPreview() {
   previewMode.value = 'preview'
 }
 
+function connectSteps(payload: { fromIdx: number; toIdx: number; buttonId?: string }) {
+  const { fromIdx, toIdx, buttonId } = payload
+  const fromStep = formData.value.steps[fromIdx]
+  const toStep = formData.value.steps[toIdx]
+  if (!fromStep || !toStep) return
+
+  if (fromStep.message_type === 'buttons') {
+    // If connection started from a specific button handle, map that button directly.
+    if (buttonId) {
+      fromStep.conditional_next = fromStep.conditional_next || {}
+      fromStep.conditional_next[buttonId] = toStep.step_name
+      hasUnsavedChanges.value = true
+      toast.success(`Connected button ${buttonId} → ${toStep.step_name}`)
+      return
+    }
+
+    // Fallback for step-level output handle on button steps: route all reply buttons.
+    const replyButtons = (fromStep.buttons || []).filter(b => !b.type || b.type === 'reply')
+    if (replyButtons.length === 0) {
+      toast.info('No reply buttons available to connect.')
+      return
+    }
+    fromStep.conditional_next = fromStep.conditional_next || {}
+    replyButtons.forEach((btn, idx) => {
+      const id = btn.id || `btn_${idx + 1}`
+      fromStep.conditional_next![id] = toStep.step_name
+    })
+    hasUnsavedChanges.value = true
+    toast.success(`Connected ${replyButtons.length} button route(s) → ${toStep.step_name}`)
+    return
+  }
+
+  fromStep.next_step = toStep.step_name
+  hasUnsavedChanges.value = true
+  toast.success(`Connected ${fromStep.step_name} → ${toStep.step_name}`)
+}
+
 function confirmDeleteStep(index: number) {
   stepToDeleteIndex.value = index
   deleteStepDialogOpen.value = true
@@ -642,6 +679,33 @@ function setButtonNextStep(buttonId: string, targetStep: string | number | bigin
   } else {
     delete selectedStep.value.conditional_next[buttonId]
   }
+}
+
+function getNextStepOverrideValue(): string {
+  if (!selectedStep.value) return '__sequential__'
+  return selectedStep.value.next_step || '__sequential__'
+}
+
+function setNextStepOverride(targetStep: string | number | bigint | Record<string, any> | null) {
+  if (!selectedStep.value || typeof targetStep !== 'string') return
+  // "__sequential__" means use natural step order (no explicit connection override)
+  if (targetStep === '__sequential__') {
+    selectedStep.value.next_step = ''
+  } else {
+    selectedStep.value.next_step = targetStep
+  }
+}
+
+function hasButtonRouteOverrides(): boolean {
+  if (!selectedStep.value || selectedStep.value.message_type !== 'buttons') return false
+  return !!selectedStep.value.conditional_next && Object.keys(selectedStep.value.conditional_next).length > 0
+}
+
+function clearAllButtonRoutes() {
+  if (!selectedStep.value || selectedStep.value.message_type !== 'buttons') return
+  selectedStep.value.conditional_next = {}
+  hasUnsavedChanges.value = true
+  toast.success('Cleared all button route overrides')
 }
 
 // API header helpers
@@ -999,6 +1063,7 @@ function confirmCancel() {
             @add-step="addStep"
             @select-flow-settings="selectFlowSettings"
             @open-preview="openPreview"
+            @connect-steps="connectSteps"
           />
         </template>
 
@@ -1687,6 +1752,49 @@ function confirmCancel() {
                 <component :is="advancedOpen ? ChevronDown : ChevronRight" class="h-4 w-4" />
               </CollapsibleTrigger>
               <CollapsibleContent class="pt-3 space-y-3">
+                <div v-if="selectedStep.message_type === 'buttons'" class="space-y-1.5">
+                  <Label class="text-xs">Button Route Overrides</Label>
+                  <div class="text-xs text-muted-foreground">
+                    Diagram/button wiring for this step is stored per button in <code>conditional_next</code>, not in Next Step Override.
+                  </div>
+                  <div class="flex items-center justify-between rounded-md border p-2 bg-muted/20">
+                    <span class="text-xs">
+                      {{ hasButtonRouteOverrides() ? `Configured (${Object.keys(selectedStep.conditional_next || {}).length})` : 'None configured' }}
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      class="h-7 text-xs"
+                      :disabled="!hasButtonRouteOverrides()"
+                      @click="clearAllButtonRoutes"
+                    >
+                      Clear all
+                    </Button>
+                  </div>
+                </div>
+
+                <div class="space-y-1.5">
+                  <Label class="text-xs">Next Step Override</Label>
+                  <Select
+                    :model-value="getNextStepOverrideValue()"
+                    @update:model-value="setNextStepOverride($event)"
+                  >
+                    <SelectTrigger class="h-8 text-xs">
+                      <SelectValue placeholder="Sequential (default order)" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__sequential__">Sequential (default order)</SelectItem>
+                      <SelectItem
+                        v-for="step in stepsWithNames.filter(s => s.step_name !== selectedStep.step_name)"
+                        :key="`next-${step.step_name}`"
+                        :value="step.step_name"
+                      >
+                        {{ step.step_name }}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p class="text-xs text-muted-foreground">Use this to remove or change diagram connections for non-button steps.</p>
+                </div>
                 <div class="space-y-1.5">
                   <Label class="text-xs">{{ $t('flowBuilder.skipCondition') }}</Label>
                   <Input v-model="selectedStep.skip_condition" :placeholder="$t('flowBuilder.skipConditionPlaceholder')" class="h-8 text-xs font-mono" />

@@ -993,24 +993,42 @@ func (a *App) processFlowResponse(account *models.WhatsAppAccount, session *mode
 	}
 
 	// Check conditional next - use buttonID first (for button/list responses), then userInput
+	conditionalRouteSelected := false
 	if len(currentStep.ConditionalNext) > 0 {
 		// Try buttonID first (for interactive responses)
 		if buttonID != "" {
 			if next, ok := currentStep.ConditionalNext[buttonID].(string); ok {
 				nextStepName = next
+				conditionalRouteSelected = true
 			} else if next, ok := currentStep.ConditionalNext[userInput].(string); ok {
 				nextStepName = next
+				conditionalRouteSelected = true
 			} else if defaultNext, ok := currentStep.ConditionalNext["default"].(string); ok {
 				nextStepName = defaultNext
+				conditionalRouteSelected = true
 			}
 		} else {
 			// Text input - try matching the text
 			if next, ok := currentStep.ConditionalNext[userInput].(string); ok {
 				nextStepName = next
+				conditionalRouteSelected = true
 			} else if defaultNext, ok := currentStep.ConditionalNext["default"].(string); ok {
 				nextStepName = defaultNext
+				conditionalRouteSelected = true
 			}
 		}
+	}
+
+	// Preserve explicit graph wiring from conditional routes by forcing the selected
+	// step once (skip_condition should not override this immediate transition).
+	if conditionalRouteSelected && nextStepName != "" {
+		sessionData := session.SessionData
+		if sessionData == nil {
+			sessionData = models.JSONB{}
+		}
+		sessionData["_forced_step_once"] = nextStepName
+		a.DB.Model(session).Update("session_data", sessionData)
+		session.SessionData = sessionData
 	}
 
 	// Move to next step or complete flow
@@ -1221,13 +1239,23 @@ func (a *App) sendStepWithSkipCheck(account *models.WhatsAppAccount, session *mo
 		return
 	}
 
-	// Check if step should be skipped
+	// Check if step should be skipped.
+	// If this step was explicitly selected via conditional_next, execute it once even
+	// if skip_condition evaluates true.
 	sessionData := session.SessionData
 	if sessionData == nil {
 		sessionData = models.JSONB{}
 	}
 
-	if a.shouldSkipStep(step, sessionData) {
+	forcedOnce := false
+	if forcedStep, ok := sessionData["_forced_step_once"].(string); ok && forcedStep == step.StepName {
+		forcedOnce = true
+		delete(sessionData, "_forced_step_once")
+		a.DB.Model(session).Update("session_data", sessionData)
+		session.SessionData = sessionData
+	}
+
+	if !forcedOnce && a.shouldSkipStep(step, sessionData) {
 		a.Log.Info("Skipping step", "step", step.StepName, "condition", step.SkipCondition)
 		skippedSteps[step.StepName] = true
 
