@@ -555,18 +555,18 @@ func (p *SLAProcessor) processSystemNoReplySequences(contact models.Contact, ina
 	switch seq {
 	case "burned_buyer":
 		stages = []stageCfg{
-			{threshold: 1 * time.Minute, message: "Quick follow-up—most people I speak to got burned by agencies at some point."},
-			{threshold: 1 * time.Minute, message: "Biggest difference we've seen -> guidance > execution. Happy to explain if you're exploring again."},
-			{threshold: 1 * time.Minute, message: "Worth a quick chat or should I close this?"},
+			{threshold: 24 * time.Hour, message: "Quick follow-up—most people I speak to got burned by agencies at some point."},
+			{threshold: 72 * time.Hour, message: "Biggest difference we've seen -> guidance > execution. Happy to explain if you're exploring again."},
+			{threshold: 120 * time.Hour, message: "Worth a quick chat or should I close this?"},
 		}
 	case "master_sales_qualification":
 		stages = []stageCfg{
-			{threshold: 1 * time.Minute, message: "Hey {{name}}, just checking—are you currently trying to grow something or exploring ideas?"},
-			{threshold: 1 * time.Minute, message: "Most people I speak to are either stuck starting or stuck scaling. Where do you feel you are?"},
+			{threshold: 24 * time.Hour, message: "Hey {{name}}, just checking—are you currently trying to grow something or exploring ideas?"},
+			{threshold: 72 * time.Hour, message: "Most people I speak to are either stuck starting or stuck scaling. Where do you feel you are?"},
 		}
 	case "revenue_reengagement":
 		stages = []stageCfg{
-			{threshold: 1 * time.Minute, message: "Hey {{name}}, just checking in — are you interested in increasing sales this month?"},
+			{threshold: 24 * time.Hour, message: "Hey {{name}}, just checking in — are you interested in increasing sales this month?"},
 		}
 	default:
 		return false
