@@ -11,6 +11,7 @@ import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Switch } from '@/components/ui/switch'
 import { Separator } from '@/components/ui/separator'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   Select,
   SelectContent,
@@ -53,6 +54,7 @@ import {
   ExternalLink,
   Reply,
   Phone,
+  HelpCircle,
 } from 'lucide-vue-next'
 import draggable from 'vuedraggable'
 import FlowChart from '@/components/chatbot/flow-builder/FlowChart.vue'
@@ -362,6 +364,38 @@ function getStepIcon(messageType: string) {
 function getStepLabel(messageType: string) {
   const type = messageTypes.value.find(t => t.value === messageType)
   return type?.label || t('flowBuilder.messageTypeText')
+}
+
+function getStepTypeDescription(messageType: string) {
+  switch (messageType) {
+    case 'text':
+      return 'Sends a plain auto-reply message.'
+    case 'buttons':
+      return 'Shows choices and routes by selection.'
+    case 'api_fetch':
+      return 'Calls API and replies with mapped data.'
+    case 'whatsapp_flow':
+      return 'Opens a native WhatsApp form flow.'
+    case 'transfer':
+      return 'Hands off conversation to agent/team.'
+    default:
+      return 'Conversation step in this flow.'
+  }
+}
+
+function getFieldHelp(field: string) {
+  const help: Record<string, string> = {
+    step_name: 'Internal unique identifier used for routing. Use clear names like pro_plan_reply.',
+    store_as: 'Stores user input in a variable for use in later messages/conditions.',
+    message_text: 'The message content sent to the user at this step.',
+    input_type: 'Defines what kind of user response this step expects.',
+    validation_regex: 'Optional rule to validate user input format before moving on.',
+    skip_condition: 'Skip this step when condition evaluates true (advanced behavior).',
+    trigger_keywords: 'Incoming keywords that start this flow.',
+    initial_message: 'One-time intro message sent when flow starts (before first step).',
+    completion_message: 'Final message sent when flow reaches completion.'
+  }
+  return help[field] || ''
 }
 
 // Watch for changes to mark unsaved
@@ -969,7 +1003,7 @@ function confirmCancel() {
       >
         <CardHeader class="py-3 px-4 border-b">
           <div class="flex items-center justify-between">
-            <CardTitle class="text-sm font-medium">{{ $t('flowBuilder.steps') }}</CardTitle>
+            <CardTitle class="text-sm font-semibold text-indigo-700 dark:text-indigo-300">{{ $t('flowBuilder.steps') }}</CardTitle>
             <Button variant="outline" size="sm" @click="addStep">
               <Plus class="h-4 w-4 mr-1" />
               {{ $t('flowBuilder.add') }}
@@ -988,7 +1022,7 @@ function confirmCancel() {
             >
               <Settings class="h-4 w-4 text-muted-foreground flex-shrink-0" />
               <div class="flex-1 min-w-0">
-                <span class="text-sm font-medium">{{ $t('flowBuilder.flowSettings') }}</span>
+                <span class="text-sm font-semibold text-indigo-700 dark:text-indigo-300">{{ $t('flowBuilder.flowSettings') }}</span>
                 <p class="text-xs text-muted-foreground">{{ $t('flowBuilder.messagesWebhook') }}</p>
               </div>
             </div>
@@ -1020,6 +1054,9 @@ function confirmCancel() {
                       <component :is="getStepIcon(step.message_type)" class="h-3 w-3" />
                       <span>{{ getStepLabel(step.message_type) }}</span>
                     </div>
+                    <p class="mt-1 text-[10px] text-muted-foreground/90 line-clamp-2">
+                      {{ getStepTypeDescription(step.message_type) }}
+                    </p>
                   </div>
                   <Button
                     variant="ghost"
@@ -1098,7 +1135,7 @@ function confirmCancel() {
         :style="{ width: propertiesPanelWidth + 'px' }"
       >
         <CardHeader class="py-3 px-4 border-b">
-          <CardTitle class="text-sm font-medium">
+          <CardTitle class="text-sm font-semibold text-indigo-700 dark:text-indigo-300">
             {{ showFlowSettings ? $t('flowBuilder.flowSettings') : $t('flowBuilder.stepProperties') }}
           </CardTitle>
         </CardHeader>
@@ -1108,7 +1145,15 @@ function confirmCancel() {
           <div class="p-4 space-y-4">
             <!-- Trigger Keywords -->
             <div class="space-y-1.5">
-              <Label class="text-xs">{{ $t('flowBuilder.triggerKeywords') }}</Label>
+              <Label class="text-xs font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300 flex items-center gap-1.5">
+                {{ $t('flowBuilder.triggerKeywords') }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <HelpCircle class="h-3.5 w-3.5 text-muted-foreground cursor-pointer" />
+                  </TooltipTrigger>
+                  <TooltipContent class="max-w-xs text-xs">{{ getFieldHelp('trigger_keywords') }}</TooltipContent>
+                </Tooltip>
+              </Label>
               <Input
                 v-model="formData.trigger_keywords"
                 :placeholder="$t('flowBuilder.triggerKeywordsPlaceholder')"
@@ -1121,7 +1166,15 @@ function confirmCancel() {
 
             <!-- Initial Message -->
             <div class="space-y-1.5">
-              <Label class="text-xs">{{ $t('flowBuilder.initialMessage') }}</Label>
+              <Label class="text-xs font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300 flex items-center gap-1.5">
+                {{ $t('flowBuilder.initialMessage') }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <HelpCircle class="h-3.5 w-3.5 text-muted-foreground cursor-pointer" />
+                  </TooltipTrigger>
+                  <TooltipContent class="max-w-xs text-xs">{{ getFieldHelp('initial_message') }}</TooltipContent>
+                </Tooltip>
+              </Label>
               <Textarea
                 v-model="formData.initial_message"
                 :placeholder="$t('flowBuilder.initialMessagePlaceholder')"
@@ -1135,7 +1188,15 @@ function confirmCancel() {
 
             <!-- Completion Message -->
             <div class="space-y-1.5">
-              <Label class="text-xs">{{ $t('flowBuilder.completionMessage') }}</Label>
+              <Label class="text-xs font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300 flex items-center gap-1.5">
+                {{ $t('flowBuilder.completionMessage') }}
+                <Tooltip>
+                  <TooltipTrigger as-child>
+                    <HelpCircle class="h-3.5 w-3.5 text-muted-foreground cursor-pointer" />
+                  </TooltipTrigger>
+                  <TooltipContent class="max-w-xs text-xs">{{ getFieldHelp('completion_message') }}</TooltipContent>
+                </Tooltip>
+              </Label>
               <Textarea
                 v-model="formData.completion_message"
                 :placeholder="$t('flowBuilder.completionMessagePlaceholder')"
@@ -1149,7 +1210,7 @@ function confirmCancel() {
 
             <!-- On Complete Action -->
             <Collapsible v-model:open="webhookHeadersOpen">
-              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-medium">
+              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-semibold text-indigo-700 dark:text-indigo-300">
                 {{ $t('flowBuilder.onCompletion') }}
                 <component :is="webhookHeadersOpen ? ChevronDown : ChevronRight" class="h-4 w-4" />
               </CollapsibleTrigger>
@@ -1238,7 +1299,7 @@ function confirmCancel() {
 
             <!-- Panel Display Settings -->
             <Collapsible v-model:open="panelConfigOpen">
-              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-medium">
+              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-semibold text-indigo-700 dark:text-indigo-300">
                 {{ $t('flowBuilder.panelDisplaySettings') }}
                 <component :is="panelConfigOpen ? ChevronDown : ChevronRight" class="h-4 w-4" />
               </CollapsibleTrigger>
@@ -1405,11 +1466,27 @@ function confirmCancel() {
             <!-- Basic Properties -->
             <div class="space-y-3">
               <div class="space-y-1.5">
-                <Label class="text-xs">{{ $t('flowBuilder.stepName') }}</Label>
+                <Label class="text-xs flex items-center gap-1.5">
+                  {{ $t('flowBuilder.stepName') }}
+                  <Tooltip>
+                    <TooltipTrigger as-child>
+                      <HelpCircle class="h-3.5 w-3.5 text-muted-foreground cursor-pointer" />
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-xs text-xs">{{ getFieldHelp('step_name') }}</TooltipContent>
+                  </Tooltip>
+                </Label>
                 <Input v-model="selectedStep.step_name" :placeholder="$t('flowBuilder.stepNamePlaceholder')" class="h-8" />
               </div>
               <div class="space-y-1.5">
-                <Label class="text-xs">{{ $t('flowBuilder.storeResponseAs') }}</Label>
+                <Label class="text-xs flex items-center gap-1.5">
+                  {{ $t('flowBuilder.storeResponseAs') }}
+                  <Tooltip>
+                    <TooltipTrigger as-child>
+                      <HelpCircle class="h-3.5 w-3.5 text-muted-foreground cursor-pointer" />
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-xs text-xs">{{ getFieldHelp('store_as') }}</TooltipContent>
+                  </Tooltip>
+                </Label>
                 <Input v-model="selectedStep.store_as" :placeholder="$t('flowBuilder.variableNamePlaceholder')" class="h-8" />
                 <p class="text-xs text-muted-foreground">{{ $t('flowBuilder.storeResponseHint') }}</p>
               </div>
@@ -1419,7 +1496,7 @@ function confirmCancel() {
 
             <!-- Message Configuration -->
             <Collapsible v-model:open="messagesOpen">
-              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-medium">
+              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-semibold text-indigo-700 dark:text-indigo-300">
                 {{ $t('flowBuilder.message') }}
                 <component :is="messagesOpen ? ChevronDown : ChevronRight" class="h-4 w-4" />
               </CollapsibleTrigger>
@@ -1427,7 +1504,15 @@ function confirmCancel() {
                 <!-- Text / Buttons Message -->
                 <template v-if="selectedStep.message_type === 'text' || selectedStep.message_type === 'buttons'">
                   <div class="space-y-1.5">
-                    <Label class="text-xs">{{ $t('flowBuilder.messageText') }}</Label>
+                    <Label class="text-xs flex items-center gap-1.5">
+                      {{ $t('flowBuilder.messageText') }}
+                      <Tooltip>
+                        <TooltipTrigger as-child>
+                          <HelpCircle class="h-3.5 w-3.5 text-muted-foreground cursor-pointer" />
+                        </TooltipTrigger>
+                        <TooltipContent class="max-w-xs text-xs">{{ getFieldHelp('message_text') }}</TooltipContent>
+                      </Tooltip>
+                    </Label>
                     <Textarea
                       v-model="selectedStep.message"
                       :placeholder="$t('flowBuilder.messagePlaceholder')"
@@ -1674,13 +1759,21 @@ function confirmCancel() {
 
             <!-- Input Configuration (not for transfer) -->
             <Collapsible v-if="selectedStep.message_type !== 'transfer'" v-model:open="inputOpen">
-              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-medium">
+              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-semibold text-indigo-700 dark:text-indigo-300">
                 {{ $t('flowBuilder.input') }}
                 <component :is="inputOpen ? ChevronDown : ChevronRight" class="h-4 w-4" />
               </CollapsibleTrigger>
               <CollapsibleContent class="pt-3 space-y-3">
                 <div class="space-y-1.5">
-                  <Label class="text-xs">{{ $t('flowBuilder.expectedInputType') }}</Label>
+                  <Label class="text-xs flex items-center gap-1.5">
+                    {{ $t('flowBuilder.expectedInputType') }}
+                    <Tooltip>
+                      <TooltipTrigger as-child>
+                        <HelpCircle class="h-3.5 w-3.5 text-muted-foreground cursor-pointer" />
+                      </TooltipTrigger>
+                      <TooltipContent class="max-w-xs text-xs">{{ getFieldHelp('input_type') }}</TooltipContent>
+                    </Tooltip>
+                  </Label>
                   <Select
                     :model-value="selectedStep.input_type"
                     @update:model-value="setInputType($event)"
@@ -1712,13 +1805,21 @@ function confirmCancel() {
 
             <!-- Validation (not for transfer) -->
             <Collapsible v-if="selectedStep.message_type !== 'transfer'" v-model:open="validationOpen">
-              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-medium">
+              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-semibold text-indigo-700 dark:text-indigo-300">
                 {{ $t('flowBuilder.validation') }}
                 <component :is="validationOpen ? ChevronDown : ChevronRight" class="h-4 w-4" />
               </CollapsibleTrigger>
               <CollapsibleContent class="pt-3 space-y-3">
                 <div class="space-y-1.5">
-                  <Label class="text-xs">{{ $t('flowBuilder.validationRegex') }}</Label>
+                  <Label class="text-xs flex items-center gap-1.5">
+                    {{ $t('flowBuilder.validationRegex') }}
+                    <Tooltip>
+                      <TooltipTrigger as-child>
+                        <HelpCircle class="h-3.5 w-3.5 text-muted-foreground cursor-pointer" />
+                      </TooltipTrigger>
+                      <TooltipContent class="max-w-xs text-xs">{{ getFieldHelp('validation_regex') }}</TooltipContent>
+                    </Tooltip>
+                  </Label>
                   <Input v-model="selectedStep.validation_regex" :placeholder="$t('flowBuilder.validationRegexPlaceholder')" class="h-8 text-xs font-mono" />
                 </div>
                 <div class="space-y-1.5">
@@ -1747,7 +1848,7 @@ function confirmCancel() {
 
             <!-- Advanced (not for transfer) -->
             <Collapsible v-if="selectedStep.message_type !== 'transfer'" v-model:open="advancedOpen">
-              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-medium">
+              <CollapsibleTrigger class="flex items-center justify-between w-full py-1 text-sm font-semibold text-indigo-700 dark:text-indigo-300">
                 {{ $t('flowBuilder.advanced') }}
                 <component :is="advancedOpen ? ChevronDown : ChevronRight" class="h-4 w-4" />
               </CollapsibleTrigger>
@@ -1796,7 +1897,15 @@ function confirmCancel() {
                   <p class="text-xs text-muted-foreground">Use this to remove or change diagram connections for non-button steps.</p>
                 </div>
                 <div class="space-y-1.5">
-                  <Label class="text-xs">{{ $t('flowBuilder.skipCondition') }}</Label>
+                  <Label class="text-xs flex items-center gap-1.5">
+                    {{ $t('flowBuilder.skipCondition') }}
+                    <Tooltip>
+                      <TooltipTrigger as-child>
+                        <HelpCircle class="h-3.5 w-3.5 text-muted-foreground cursor-pointer" />
+                      </TooltipTrigger>
+                      <TooltipContent class="max-w-xs text-xs">{{ getFieldHelp('skip_condition') }}</TooltipContent>
+                    </Tooltip>
+                  </Label>
                   <Input v-model="selectedStep.skip_condition" :placeholder="$t('flowBuilder.skipConditionPlaceholder')" class="h-8 text-xs font-mono" />
                   <p class="text-xs text-muted-foreground">{{ $t('flowBuilder.skipConditionHint') }}</p>
                 </div>

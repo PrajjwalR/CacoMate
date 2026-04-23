@@ -14,8 +14,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/seeds"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
+	"gorm.io/gorm"
 )
 
 // IncomingTextMessage represents a text, interactive, or media message from the webhook
@@ -284,12 +286,27 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 	// Clear chatbot tracking since client has replied
 	a.ClearContactChatbotTracking(contact.ID)
 
-	// Check for active agent transfer - skip chatbot processing if transferred
+	// Check for active agent transfer.
+	// Allow explicit chatbot hand-back keywords (e.g. "bot") or flow triggers
+	// to automatically resume chatbot processing.
 	if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
-		a.Log.Info("Contact has active agent transfer, skipping chatbot processing",
-			"contact_id", contact.ID,
-			"phone_number", contact.PhoneNumber)
-		return
+		if a.shouldResumeTransferForChatbot(account.OrganizationID, account.Name, messageText) {
+			if !a.resumeActiveTransfersForChatbot(account, contact, messageText) {
+				a.Log.Warn("Failed to resume active transfer for chatbot hand-back",
+					"contact_id", contact.ID,
+					"phone_number", contact.PhoneNumber)
+				return
+			}
+			a.Log.Info("Active transfer resumed by chatbot hand-back keyword/trigger",
+				"contact_id", contact.ID,
+				"phone_number", contact.PhoneNumber,
+				"message_text", messageText)
+		} else {
+			a.Log.Info("Contact has active agent transfer, skipping chatbot processing",
+				"contact_id", contact.ID,
+				"phone_number", contact.PhoneNumber)
+			return
+		}
 	}
 
 	// Check if chatbot is enabled for this account (use cache)
@@ -334,6 +351,7 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 
 	// Get or create active session for this contact
 	session, isNewSession := a.getOrCreateSession(account.OrganizationID, contact.ID, account.Name, msg.From, settings.SessionTimeoutMins)
+	aiTakeoverMode := isAITakeoverSession(session)
 
 	// Log incoming message to session
 	a.logSessionMessage(session.ID, models.DirectionIncoming, messageText, "keyword_check")
@@ -370,14 +388,21 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		return
 	}
 
-	// Try to match flow trigger keywords first (before greeting to avoid duplicate messages)
+	// Try to match flow trigger keywords first (before greeting to avoid duplicate messages).
+	// Even in AI takeover mode, allow explicit trigger keywords to restart a flow.
 	if flow := a.matchFlowTrigger(account.OrganizationID, account.Name, messageText); flow != nil {
+		// Clear AI takeover flag when user explicitly triggers a flow again.
+		if aiTakeoverMode && session.SessionData != nil {
+			delete(session.SessionData, "_ai_takeover")
+			a.DB.Model(session).Update("session_data", session.SessionData)
+		}
 		a.startFlow(account, session, contact, flow)
 		return
 	}
 
-	// Send greeting message for new sessions (only if no flow was triggered)
-	if isNewSession && settings.DefaultResponse != "" {
+	// Send greeting message for new sessions (only if no flow was triggered).
+	// When AI takeover mode is active, skip greeting and go straight to AI.
+	if !aiTakeoverMode && isNewSession && settings.DefaultResponse != "" {
 		a.Log.Info("New session - sending greeting message", "contact", contact.PhoneNumber)
 		if len(settings.GreetingButtons) > 0 {
 			greetingButtons := make([]map[string]interface{}, 0)
@@ -404,8 +429,9 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		return // After greeting, don't process further for new sessions
 	}
 
-	// Handle non-transfer keyword matches (transfer was already handled above)
-	if keywordMatched && keywordResponse.ResponseType != models.ResponseTypeTransfer {
+	// Handle non-transfer keyword matches (transfer was already handled above).
+	// In AI takeover mode, prefer AI over keyword canned replies.
+	if !aiTakeoverMode && keywordMatched && keywordResponse.ResponseType != models.ResponseTypeTransfer {
 		a.Log.Info("Keyword rule matched", "response_type", keywordResponse.ResponseType, "response", keywordResponse.Body)
 
 		// Handle regular text response
@@ -423,11 +449,16 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		return
 	}
 
+	aiAttempted := false
+	aiFailed := false
+
 	// If no keyword matched, try AI response if enabled
 	if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
+		aiAttempted = true
 		a.Log.Info("Attempting AI response", "provider", settings.AI.Provider, "model", settings.AI.Model)
 		aiResponse, err := a.generateAIResponse(settings, session, messageText)
 		if err != nil {
+			aiFailed = true
 			a.Log.Error("AI response failed", "error", err, "provider", settings.AI.Provider, "model", settings.AI.Model)
 			// Fall through to default response
 		} else if aiResponse != "" {
@@ -471,6 +502,16 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 		}
 		a.logSessionMessage(session.ID, models.DirectionOutgoing, settings.FallbackMessage, "fallback_response")
 	} else if !isNewSession {
+		// Avoid silent chats when AI fails/misconfigures and no fallback is configured.
+		if aiAttempted && aiFailed {
+			genericFallback := "Sorry, I’m having trouble replying right now. Please type your question again after sometime."
+			if err := a.sendAndSaveTextMessage(account, contact, genericFallback); err != nil {
+				a.Log.Error("Failed to send generic fallback message", "error", err, "contact", contact.PhoneNumber)
+			} else {
+				a.logSessionMessage(session.ID, models.DirectionOutgoing, genericFallback, "fallback_response")
+			}
+			return
+		}
 		a.Log.Info("No fallback message configured for existing session")
 	}
 }
@@ -780,7 +821,104 @@ func (a *App) matchFlowTrigger(orgID uuid.UUID, accountName, messageText string)
 			}
 		}
 	}
+
+	// No match from cache. Fallback to fresh DB read to avoid stale-cache misses
+	// right after flow/keyword updates.
+	var freshFlows []models.ChatbotFlow
+	if err := a.DB.Where("organization_id = ? AND is_enabled = true", orgID).
+		Preload("Steps", func(db *gorm.DB) *gorm.DB {
+			return db.Order("step_order ASC")
+		}).
+		Find(&freshFlows).Error; err != nil {
+		a.Log.Error("Failed to fetch fresh chatbot flows for trigger fallback", "error", err, "org_id", orgID)
+		return nil
+	}
+
+	for _, flow := range freshFlows {
+		for _, keyword := range flow.TriggerKeywords {
+			if strings.Contains(messageLower, strings.ToLower(keyword)) {
+				// Refresh cache for subsequent requests.
+				if data, err := json.Marshal(freshFlows); err == nil {
+					ctx := context.Background()
+					cacheKey := fmt.Sprintf("%s%s", flowsCachePrefix, orgID.String())
+					a.Redis.Set(ctx, cacheKey, data, flowsCacheTTL)
+				}
+				return &flow
+			}
+		}
+	}
+
 	return nil
+}
+
+func (a *App) shouldResumeTransferForChatbot(orgID uuid.UUID, accountName, messageText string) bool {
+	trimmed := strings.TrimSpace(strings.ToLower(messageText))
+	if trimmed == "" {
+		return false
+	}
+
+	// Explicit hand-back keyword to exit active transfer and resume chatbot.
+	if trimmed == "bot" {
+		return true
+	}
+
+	// Any flow trigger also acts as chatbot hand-back.
+	return a.matchFlowTrigger(orgID, accountName, messageText) != nil
+}
+
+func (a *App) resumeActiveTransfersForChatbot(account *models.WhatsAppAccount, contact *models.Contact, messageText string) bool {
+	var activeTransfers []models.AgentTransfer
+	if err := a.DB.Where("organization_id = ? AND contact_id = ? AND status = ?",
+		account.OrganizationID, contact.ID, models.TransferStatusActive).
+		Find(&activeTransfers).Error; err != nil {
+		a.Log.Error("Failed to load active transfers for chatbot hand-back",
+			"error", err,
+			"contact_id", contact.ID)
+		return false
+	}
+
+	if len(activeTransfers) == 0 {
+		return true
+	}
+
+	now := time.Now()
+	for i := range activeTransfers {
+		transfer := &activeTransfers[i]
+		transfer.Status = models.TransferStatusResumed
+		transfer.ResumedAt = &now
+		transfer.ResumedBy = nil
+
+		if err := a.DB.Model(&models.AgentTransfer{}).
+			Where("id = ?", transfer.ID).
+			Updates(map[string]any{
+				"status":     transfer.Status,
+				"resumed_at": transfer.ResumedAt,
+				"resumed_by": nil,
+			}).Error; err != nil {
+			a.Log.Error("Failed to resume transfer during chatbot hand-back",
+				"error", err,
+				"transfer_id", transfer.ID,
+				"contact_id", contact.ID)
+			return false
+		}
+
+		a.broadcastTransferResumed(transfer)
+		a.DispatchWebhook(account.OrganizationID, models.WebhookEventTransferResumed, TransferEventData{
+			TransferID:      transfer.ID.String(),
+			ContactID:       contact.ID.String(),
+			ContactPhone:    contact.PhoneNumber,
+			ContactName:     contact.ProfileName,
+			Source:          transfer.Source,
+			WhatsAppAccount: account.Name,
+		})
+	}
+
+	a.ClearContactChatbotTracking(contact.ID)
+	a.Log.Info("Resumed active transfer(s) for chatbot hand-back",
+		"contact_id", contact.ID,
+		"count", len(activeTransfers),
+		"message_text", messageText)
+	return true
 }
 
 // startFlow initiates a chatbot flow for a user
@@ -801,6 +939,29 @@ func (a *App) startFlow(account *models.WhatsAppAccount, session *models.Chatbot
 		"_flow_name": flow.Name,
 	}
 	a.DB.Save(session)
+
+	// Mark contacts in special system sequences for timed follow-ups.
+	if flow.Name == seeds.SystemBurnedBuyerFlowName || flow.Name == seeds.SystemMasterSalesFlowName || flow.Name == seeds.SystemRevenueReengagementFlowName {
+		metadata := contact.Metadata
+		if metadata == nil {
+			metadata = models.JSONB{}
+		}
+		sequenceName := "burned_buyer"
+		if flow.Name == seeds.SystemMasterSalesFlowName {
+			sequenceName = "master_sales_qualification"
+		} else if flow.Name == seeds.SystemRevenueReengagementFlowName {
+			sequenceName = "revenue_reengagement"
+		}
+		metadata["system_sequence"] = sequenceName
+		metadata["system_sequence_stage"] = 0
+		metadata["system_sequence_started_at"] = time.Now().UTC().Format(time.RFC3339)
+		if err := a.DB.Model(&models.Contact{}).
+			Where("id = ?", contact.ID).
+			Update("metadata", metadata).Error; err != nil {
+			a.Log.Error("Failed to mark contact for system sequence", "error", err, "contact_id", contact.ID)
+		}
+		contact.Metadata = metadata
+	}
 
 	// Send initial message if configured
 	if flow.InitialMessage != "" {
@@ -836,6 +997,19 @@ func (a *App) processFlowResponse(account *models.WhatsAppAccount, session *mode
 
 	// Check for cancel keywords
 	userInputLower := strings.ToLower(userInput)
+	trimmedInput := strings.TrimSpace(userInputLower)
+
+	// Global exit commands (work in every flow, even if flow-specific cancel keywords
+	// are not configured). This lets users leave a flow and start a new one immediately.
+	if trimmedInput == "exit" || trimmedInput == "quit" || trimmedInput == "leave flow" {
+		if err := a.sendAndSaveTextMessage(account, contact, "Exited this flow. You can start a new one anytime."); err != nil {
+			a.Log.Error("Failed to send flow exit message", "error", err, "contact", contact.PhoneNumber)
+		}
+		a.logSessionMessage(session.ID, models.DirectionOutgoing, "Exited this flow. You can start a new one anytime.", "flow_exit")
+		a.exitFlow(session)
+		return
+	}
+
 	for _, cancelKw := range flow.CancelKeywords {
 		if strings.Contains(userInputLower, strings.ToLower(cancelKw)) {
 			if err := a.sendAndSaveTextMessage(account, contact, "Flow cancelled."); err != nil {
@@ -862,6 +1036,45 @@ func (a *App) processFlowResponse(account *models.WhatsAppAccount, session *mode
 		a.Log.Error("Current step not found", "step_name", session.CurrentStep)
 		a.exitFlow(session)
 		return
+	}
+
+	// Handle recovery choice after max retries (restart step or connect to human).
+	if awaiting, ok := session.SessionData["_awaiting_recovery_action"].(bool); ok && awaiting {
+		choice := strings.TrimSpace(strings.ToLower(userInput))
+		if buttonID != "" {
+			choice = strings.ToLower(buttonID)
+		}
+
+		switch choice {
+		case "restart_step", "restart", "try again":
+			delete(session.SessionData, "_awaiting_recovery_action")
+			delete(session.SessionData, "_recovery_step_name")
+			a.DB.Model(session).Updates(map[string]interface{}{
+				"session_data": session.SessionData,
+				"step_retries": 0,
+			})
+			session.StepRetries = 0
+			a.sendStepMessage(account, session, contact, currentStep)
+			return
+		case "connect_human", "agent", "human", "connect":
+			delete(session.SessionData, "_awaiting_recovery_action")
+			delete(session.SessionData, "_recovery_step_name")
+			a.DB.Model(session).Update("session_data", session.SessionData)
+			a.createTransferToQueue(account, contact, models.TransferSourceFlow)
+			a.exitFlow(session)
+			return
+		default:
+			recoveryButtons := []map[string]interface{}{
+				{"id": "restart_step", "title": "Restart this step", "type": "reply"},
+				{"id": "connect_human", "title": "Connect me to human", "type": "reply"},
+			}
+			recoveryPrompt := "Please choose one option so I can help you better."
+			if err := a.sendAndSaveInteractiveButtons(account, contact, recoveryPrompt, recoveryButtons); err != nil {
+				a.Log.Error("Failed to send recovery buttons", "error", err, "contact", contact.PhoneNumber)
+			}
+			a.logSessionMessage(session.ID, models.DirectionOutgoing, recoveryPrompt, currentStep.StepName+"_recovery_prompt")
+			return
+		}
 	}
 
 	// Validate input if required (skip validation for button/list responses)
@@ -924,6 +1137,15 @@ func (a *App) processFlowResponse(account *models.WhatsAppAccount, session *mode
 		}
 
 		if !isValidButton {
+			// Try to infer a valid button from free-text input before treating it as invalid.
+			// This makes early-step interactions feel natural (e.g. "starting", "revenue", "yes", "not sure").
+			if inferredID, ok := inferButtonSelectionFromText(currentStep, userInput); ok {
+				buttonID = inferredID
+				isValidButton = true
+			}
+		}
+
+		if !isValidButton {
 			// Invalid button selection
 			session.StepRetries++
 			a.Log.Debug("Invalid button selection", "buttonID", buttonID, "userInput", userInput, "step", currentStep.StepName, "retries", session.StepRetries)
@@ -935,17 +1157,38 @@ func (a *App) processFlowResponse(account *models.WhatsAppAccount, session *mode
 			}
 
 			if session.StepRetries >= maxRetries {
-				// Max retries exceeded - exit flow and close conversation
-				a.Log.Warn("Max button retries exceeded, closing conversation", "step", currentStep.StepName)
-				if err := a.sendAndSaveTextMessage(account, contact, "Sorry, we couldn't continue. Please try again later."); err != nil {
-					a.Log.Error("Failed to send max retries message", "error", err, "contact", contact.PhoneNumber)
+				// Max retries exceeded - offer recovery actions instead of abrupt close.
+				a.Log.Warn("Max button retries exceeded, offering recovery actions", "step", currentStep.StepName)
+				if session.SessionData == nil {
+					session.SessionData = models.JSONB{}
 				}
-				a.exitFlow(session)
-				a.closeSession(session)
+				session.SessionData["_awaiting_recovery_action"] = true
+				session.SessionData["_recovery_step_name"] = currentStep.StepName
+				a.DB.Model(session).Update("session_data", session.SessionData)
+
+				recoveryMessage := "I can help in two ways: restart this step or connect you to a human."
+				recoveryButtons := []map[string]interface{}{
+					{"id": "restart_step", "title": "Restart this step", "type": "reply"},
+					{"id": "connect_human", "title": "Connect me to human", "type": "reply"},
+				}
+				if err := a.sendAndSaveInteractiveButtons(account, contact, recoveryMessage, recoveryButtons); err != nil {
+					a.Log.Error("Failed to send recovery options", "error", err, "contact", contact.PhoneNumber)
+				}
+				a.logSessionMessage(session.ID, models.DirectionOutgoing, recoveryMessage, currentStep.StepName+"_recovery")
 				return
 			}
 
-			// Resend the step message with buttons
+			// Provide a friendlier clarification with available options, then resend buttons.
+			options := extractStepButtonTitles(currentStep)
+			if len(options) > 0 {
+				clarification := fmt.Sprintf("No worries — please pick one option to continue: %s.", strings.Join(options, " / "))
+				if err := a.sendAndSaveTextMessage(account, contact, clarification); err != nil {
+					a.Log.Error("Failed to send button clarification", "error", err, "contact", contact.PhoneNumber)
+				}
+				a.logSessionMessage(session.ID, models.DirectionOutgoing, clarification, currentStep.StepName+"_clarification")
+			}
+
+			// Resend the step message with buttons for explicit selection.
 			a.sendStepMessage(account, session, contact, currentStep)
 			return
 		}
@@ -1080,13 +1323,31 @@ func (a *App) completeFlow(account *models.WhatsAppAccount, session *models.Chat
 		go a.sendFlowCompletionWebhook(flow, session, contact)
 	}
 
-	// Update session (keep current_flow_id for panel config reference)
-	now := time.Now()
+	// Enable AI takeover after flow completion:
+	// keep session active, clear current flow pointers, and mark handoff flag.
+	sessionData := session.SessionData
+	if sessionData == nil {
+		sessionData = models.JSONB{}
+	}
+	sessionData["_ai_takeover"] = true
+	delete(sessionData, "_flow_id")
+	delete(sessionData, "_flow_name")
+	delete(sessionData, "_forced_step_once")
+
 	a.DB.Model(session).Updates(map[string]interface{}{
-		"current_step": "",
-		"status":       models.SessionStatusCompleted,
-		"completed_at": now,
+		"current_flow_id": nil,
+		"current_step":    "",
+		"step_retries":    0,
+		"status":          models.SessionStatusActive,
+		"completed_at":    nil,
+		"session_data":    sessionData,
+		"last_activity_at": time.Now(),
 	})
+	session.CurrentFlowID = nil
+	session.CurrentStep = ""
+	session.StepRetries = 0
+	session.Status = models.SessionStatusActive
+	session.SessionData = sessionData
 
 	// Clear chatbot tracking so SLA doesn't fire after flow completion
 	a.ClearContactChatbotTracking(contact.ID)
@@ -1678,17 +1939,82 @@ func (a *App) fetchApiResponse(apiConfig models.JSONB, sessionData models.JSONB,
 func (a *App) generateAIResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string) (string, error) {
 	// Build context from AIContext entries
 	contextData := a.buildAIContext(settings.OrganizationID, session, userMessage)
+	systemPrompt := a.buildAISystemPrompt(settings, session, contextData)
 
 	switch settings.AI.Provider {
 	case models.AIProviderOpenAI:
-		return a.generateOpenAIResponse(settings, session, userMessage, contextData)
+		return a.generateOpenAIResponse(settings, session, userMessage, systemPrompt)
 	case models.AIProviderAnthropic:
-		return a.generateAnthropicResponse(settings, session, userMessage, contextData)
+		return a.generateAnthropicResponse(settings, session, userMessage, systemPrompt)
 	case models.AIProviderGoogle:
-		return a.generateGoogleResponse(settings, session, userMessage, contextData)
+		return a.generateGoogleResponse(settings, session, userMessage, systemPrompt)
 	default:
 		return "", fmt.Errorf("unsupported AI provider: %s", settings.AI.Provider)
 	}
+}
+
+// buildAISystemPrompt creates a richer instruction block for better quality replies.
+func (a *App) buildAISystemPrompt(settings *models.ChatbotSettings, session *models.ChatbotSession, contextData string) string {
+	basePrompt := strings.TrimSpace(settings.AI.SystemPrompt)
+	if basePrompt == "" {
+		basePrompt = "You are a concise WhatsApp assistant for business conversations. Be helpful, practical, and friendly."
+	}
+
+	styleGuide := strings.Join([]string{
+		"Response rules:",
+		"- Keep replies short and clear (2-4 lines max).",
+		"- Answer directly, then ask at most one relevant follow-up question if needed.",
+		"- Prefer actionable suggestions over generic advice.",
+		"- Use plain text suitable for WhatsApp (no markdown tables/code).",
+		"- If user intent is unclear, ask a clarifying question.",
+	}, "\n")
+
+	sessionFacts := a.buildAISessionFacts(session)
+
+	var parts []string
+	parts = append(parts, basePrompt)
+	parts = append(parts, styleGuide)
+	if sessionFacts != "" {
+		parts = append(parts, "Session context:\n"+sessionFacts)
+	}
+	if strings.TrimSpace(contextData) != "" {
+		parts = append(parts, strings.TrimSpace(contextData))
+	}
+
+	return strings.Join(parts, "\n\n")
+}
+
+func (a *App) buildAISessionFacts(session *models.ChatbotSession) string {
+	if session == nil || session.SessionData == nil {
+		return ""
+	}
+	var lines []string
+	for k, v := range session.SessionData {
+		// Skip internal metadata keys
+		if strings.HasPrefix(k, "_") {
+			continue
+		}
+		if v == nil {
+			continue
+		}
+		val := strings.TrimSpace(fmt.Sprintf("%v", v))
+		if val == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- %s: %s", k, val))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n")
+}
+
+func cleanAIResponse(text string) string {
+	text = strings.TrimSpace(text)
+	text = strings.Trim(text, "\"")
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	return strings.TrimSpace(text)
 }
 
 // buildAIContext fetches and combines all AI context data
@@ -1833,21 +2159,11 @@ func (a *App) fetchAPIContext(apiConfig models.JSONB, session *models.ChatbotSes
 }
 
 // generateOpenAIResponse generates a response using OpenAI API
-func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
+func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, systemPrompt string) (string, error) {
 	url := "https://api.openai.com/v1/chat/completions"
 
 	// Build messages array
 	messages := []map[string]string{}
-
-	// Build system prompt with context
-	systemPrompt := settings.AI.SystemPrompt
-	if contextData != "" {
-		if systemPrompt != "" {
-			systemPrompt = systemPrompt + "\n\n" + contextData
-		} else {
-			systemPrompt = contextData
-		}
-	}
 
 	// Add system prompt if configured
 	if systemPrompt != "" {
@@ -1931,14 +2247,14 @@ func (a *App) generateOpenAIResponse(settings *models.ChatbotSettings, session *
 	}
 
 	if len(result.Choices) > 0 {
-		return strings.TrimSpace(result.Choices[0].Message.Content), nil
+		return cleanAIResponse(result.Choices[0].Message.Content), nil
 	}
 
 	return "", fmt.Errorf("no response from OpenAI")
 }
 
 // generateAnthropicResponse generates a response using Anthropic API
-func (a *App) generateAnthropicResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
+func (a *App) generateAnthropicResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, systemPrompt string) (string, error) {
 	url := "https://api.anthropic.com/v1/messages"
 
 	// Build messages array
@@ -1969,16 +2285,6 @@ func (a *App) generateAnthropicResponse(settings *models.ChatbotSettings, sessio
 		"model":      settings.AI.Model,
 		"messages":   messages,
 		"max_tokens": settings.AI.MaxTokens,
-	}
-
-	// Build system prompt with context
-	systemPrompt := settings.AI.SystemPrompt
-	if contextData != "" {
-		if systemPrompt != "" {
-			systemPrompt = systemPrompt + "\n\n" + contextData
-		} else {
-			systemPrompt = contextData
-		}
 	}
 
 	// Add system prompt if configured
@@ -2034,7 +2340,7 @@ func (a *App) generateAnthropicResponse(settings *models.ChatbotSettings, sessio
 
 	for _, content := range result.Content {
 		if content.Type == "text" {
-			return strings.TrimSpace(content.Text), nil
+			return cleanAIResponse(content.Text), nil
 		}
 	}
 
@@ -2042,14 +2348,63 @@ func (a *App) generateAnthropicResponse(settings *models.ChatbotSettings, sessio
 }
 
 // generateGoogleResponse generates a response using Google Gemini API
-func (a *App) generateGoogleResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, contextData string) (string, error) {
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
-		settings.AI.Model, settings.AI.APIKey)
+// Uses the v1beta JSON shape (systemInstruction, camelCase). v1 /generateContent
+// does not accept systemInstruction, so we never send it there.
+func (a *App) generateGoogleResponse(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, systemPrompt string) (string, error) {
+	modelsToTry := []string{settings.AI.Model}
+	// Sensible fallbacks when the configured name is removed, renamed, or blocked for "new" keys.
+	modelsToTry = append(modelsToTry,
+		"gemini-3-flash-preview",
+		"gemini-2.5-flash",
+		"gemini-2.0-flash-exp",
+		"gemini-1.5-flash",
+		"gemini-1.5-pro",
+	)
+	modelsToTry = uniqueNonEmptyStrings(modelsToTry)
 
-	// Build contents array
+	var lastErr error
+	for _, model := range modelsToTry {
+		respText, err := a.generateGoogleResponseWithModel(settings, session, userMessage, systemPrompt, model)
+		if err == nil {
+			return respText, nil
+		}
+		lastErr = err
+
+		errMsg := strings.ToLower(err.Error())
+		if strings.Contains(errMsg, "not found") || strings.Contains(errMsg, "not supported for generatecontent") ||
+			strings.Contains(errMsg, "no longer available") {
+			a.Log.Warn("Google model unavailable, trying fallback model",
+				"configured_model", settings.AI.Model,
+				"fallback_model", model,
+				"error", err)
+			continue
+		}
+		return "", err
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("no response from Google AI")
+}
+
+func (a *App) generateGoogleResponseWithModel(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, systemPrompt string, model string) (string, error) {
+	// v1beta: official REST uses camelCase systemInstruction
+	payloadV1beta := a.buildGoogleGenerateContentPayload(settings, session, userMessage, systemPrompt, true)
+	jsonV1beta, err := json.Marshal(payloadV1beta)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	urlV1beta := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s",
+		model, settings.AI.APIKey)
+	return a.postGoogleGenerateContent(urlV1beta, jsonV1beta)
+}
+
+// buildGoogleGenerateContentPayload builds the request body. useSystemInstruction should be true
+// only for v1beta; v1 has no systemInstruction and needs inline system text instead.
+func (a *App) buildGoogleGenerateContentPayload(settings *models.ChatbotSettings, session *models.ChatbotSession, userMessage string, systemPrompt string, useSystemInstruction bool) map[string]interface{} {
 	contents := []map[string]interface{}{}
-
-	// Add conversation history if enabled
 	if settings.AI.IncludeHistory && session != nil {
 		history := a.getSessionHistory(session.ID, settings.AI.HistoryLimit)
 		for _, msg := range history {
@@ -2066,11 +2421,15 @@ func (a *App) generateGoogleResponse(settings *models.ChatbotSettings, session *
 		}
 	}
 
-	// Add current user message
+	finalUserText := userMessage
+	if !useSystemInstruction && systemPrompt != "" {
+		finalUserText = "System instructions:\n" + systemPrompt + "\n\nUser message:\n" + userMessage
+	}
+
 	contents = append(contents, map[string]interface{}{
 		"role": "user",
 		"parts": []map[string]string{
-			{"text": userMessage},
+			{"text": finalUserText},
 		},
 	})
 
@@ -2080,50 +2439,31 @@ func (a *App) generateGoogleResponse(settings *models.ChatbotSettings, session *
 			"maxOutputTokens": settings.AI.MaxTokens,
 		},
 	}
-
-	// Build system prompt with context
-	systemPrompt := settings.AI.SystemPrompt
-	if contextData != "" {
-		if systemPrompt != "" {
-			systemPrompt = systemPrompt + "\n\n" + contextData
-		} else {
-			systemPrompt = contextData
-		}
-	}
-
-	// Add system instruction if configured
-	if systemPrompt != "" {
+	if useSystemInstruction && systemPrompt != "" {
 		payload["systemInstruction"] = map[string]interface{}{
 			"parts": []map[string]string{
 				{"text": systemPrompt},
 			},
 		}
 	}
-
 	if settings.AI.Temperature > 0 {
 		payload["generationConfig"].(map[string]interface{})["temperature"] = settings.AI.Temperature
 	}
+	return payload
+}
 
-	jsonPayload, err := json.Marshal(payload)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
+func (a *App) postGoogleGenerateContent(url string, jsonPayload []byte) (string, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
-
 	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := a.HTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-
 	body, _ := io.ReadAll(resp.Body)
-
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		var errResp struct {
 			Error struct {
@@ -2133,7 +2473,6 @@ func (a *App) generateGoogleResponse(settings *models.ChatbotSettings, session *
 		_ = json.Unmarshal(body, &errResp)
 		return "", fmt.Errorf("google AI API error: %s", errResp.Error.Message)
 	}
-
 	var result struct {
 		Candidates []struct {
 			Content struct {
@@ -2146,12 +2485,27 @@ func (a *App) generateGoogleResponse(settings *models.ChatbotSettings, session *
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
-
 	if len(result.Candidates) > 0 && len(result.Candidates[0].Content.Parts) > 0 {
-		return strings.TrimSpace(result.Candidates[0].Content.Parts[0].Text), nil
+		return cleanAIResponse(result.Candidates[0].Content.Parts[0].Text), nil
 	}
-
 	return "", fmt.Errorf("no response from Google AI")
+}
+
+func uniqueNonEmptyStrings(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		val := strings.TrimSpace(item)
+		if val == "" {
+			continue
+		}
+		if _, ok := seen[val]; ok {
+			continue
+		}
+		seen[val] = struct{}{}
+		out = append(out, val)
+	}
+	return out
 }
 
 // getSessionHistory retrieves recent messages from the session
@@ -2631,4 +2985,99 @@ func parseNumber(s string) (float64, error) {
 	var n float64
 	_, err := fmt.Sscanf(s, "%f", &n)
 	return n, err
+}
+
+func isAITakeoverSession(session *models.ChatbotSession) bool {
+	if session == nil || session.SessionData == nil {
+		return false
+	}
+	v, ok := session.SessionData["_ai_takeover"].(bool)
+	return ok && v
+}
+
+// inferButtonSelectionFromText attempts to map free-text input to one of the step button IDs.
+// Returns (buttonID, true) when a confident match is found.
+func inferButtonSelectionFromText(step *models.ChatbotFlowStep, userInput string) (string, bool) {
+	input := strings.TrimSpace(strings.ToLower(userInput))
+	if input == "" {
+		return "", false
+	}
+
+	// Common aliases to make button flows less brittle for natural language input.
+	aliases := map[string][]string{
+		"beginner":      {"start", "starting", "just starting", "new", "beginner", "no revenue"},
+		"intermediate":  {"revenue", "sales", "doing revenue", "earning", "intermediate", "scaling"},
+		"hot":           {"immediately", "now", "start now", "ready"},
+		"warm":          {"exploring", "thinking", "checking"},
+		"cold":          {"later", "not now", "not interested"},
+		"yes":           {"yes", "yep", "yeah", "sure", "ok"},
+		"no":            {"no", "nope", "not now"},
+		"time":          {"time", "busy"},
+		"money":         {"money", "budget", "cost", "expensive"},
+		"skills":        {"skills", "skill", "knowledge", "learning"},
+		"clarity":       {"clarity", "confused", "not sure", "roadmap"},
+		"other":         {"other", "something else"},
+		"strategy":      {"strategy"},
+		"execution":     {"execution", "execute"},
+		"both":          {"both"},
+		"clear":         {"clear goal", "clear"},
+		"vague":         {"grow", "vague"},
+		"none":          {"not sure", "none"},
+		"ads":           {"ads", "running ads"},
+		"agency":        {"agency", "agencies", "freelancer"},
+		"self":          {"myself", "self", "learning myself"},
+		"traffic":       {"traffic", "reach", "audience"},
+		"conversion":    {"conversion", "sales", "not converting"},
+		"consistency":   {"consistency", "inconsistent", "ups and downs"},
+		"unclear":       {"not sure", "everything", "confused"},
+		"book":          {"book", "call", "book call"},
+		"details":       {"details", "need details", "info"},
+		"roadmap":       {"roadmap"},
+	}
+
+	for i, btn := range step.Buttons {
+		btnMap, ok := btn.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		btnID, _ := btnMap["id"].(string)
+		btnTitle, _ := btnMap["title"].(string)
+		if btnID == "" {
+			btnID = fmt.Sprintf("btn_%d", i+1)
+		}
+		idLower := strings.ToLower(btnID)
+		titleLower := strings.ToLower(strings.TrimSpace(btnTitle))
+
+		// Direct ID/title containment checks.
+		if input == idLower || input == titleLower || strings.Contains(input, titleLower) || strings.Contains(titleLower, input) {
+			return btnID, true
+		}
+
+		// Alias checks keyed by button ID and normalized title.
+		checkKeys := []string{idLower, strings.ReplaceAll(titleLower, " ", "_")}
+		for _, key := range checkKeys {
+			for _, alias := range aliases[key] {
+				if strings.Contains(input, alias) || strings.Contains(alias, input) {
+					return btnID, true
+				}
+			}
+		}
+	}
+
+	return "", false
+}
+
+func extractStepButtonTitles(step *models.ChatbotFlowStep) []string {
+	options := make([]string, 0, len(step.Buttons))
+	for _, btn := range step.Buttons {
+		btnMap, ok := btn.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		title, _ := btnMap["title"].(string)
+		if title != "" {
+			options = append(options, title)
+		}
+	}
+	return options
 }

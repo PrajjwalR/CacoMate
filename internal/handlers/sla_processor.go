@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -502,6 +503,11 @@ func (p *SLAProcessor) processClientInactivity(orgID uuid.UUID, settings models.
 		// Calculate time since chatbot's last message
 		timeSinceChatbotMsg := now.Sub(*contact.ChatbotLastMessageAt)
 
+		// System sequence automation: Burned Buyer +1/+3/+5 day follow-ups.
+		if p.processSystemNoReplySequences(contact, timeSinceChatbotMsg) {
+			continue
+		}
+
 		// Check if we should auto-close (takes precedence over reminder)
 		if settings.ClientInactivity.AutoCloseMinutes > 0 {
 			autoCloseThreshold := time.Duration(settings.ClientInactivity.AutoCloseMinutes) * time.Minute
@@ -519,6 +525,103 @@ func (p *SLAProcessor) processClientInactivity(orgID uuid.UUID, settings models.
 			}
 		}
 	}
+}
+
+// processSystemNoReplySequences handles hardcoded no-reply follow-up sequences.
+// Returns true if a system sequence handled this contact (to skip generic reminder logic).
+func (p *SLAProcessor) processSystemNoReplySequences(contact models.Contact, inactivity time.Duration) bool {
+	if contact.Metadata == nil {
+		return false
+	}
+	seq, _ := contact.Metadata["system_sequence"].(string)
+	if seq == "" {
+		return false
+	}
+
+	stage := 0
+	switch v := contact.Metadata["system_sequence_stage"].(type) {
+	case float64:
+		stage = int(v)
+	case int:
+		stage = v
+	}
+
+	type stageCfg struct {
+		threshold time.Duration
+		message   string
+	}
+
+	var stages []stageCfg
+	switch seq {
+	case "burned_buyer":
+		stages = []stageCfg{
+			{threshold: 1 * time.Minute, message: "Quick follow-up—most people I speak to got burned by agencies at some point."},
+			{threshold: 1 * time.Minute, message: "Biggest difference we've seen -> guidance > execution. Happy to explain if you're exploring again."},
+			{threshold: 1 * time.Minute, message: "Worth a quick chat or should I close this?"},
+		}
+	case "master_sales_qualification":
+		stages = []stageCfg{
+			{threshold: 1 * time.Minute, message: "Hey {{name}}, just checking—are you currently trying to grow something or exploring ideas?"},
+			{threshold: 1 * time.Minute, message: "Most people I speak to are either stuck starting or stuck scaling. Where do you feel you are?"},
+		}
+	case "revenue_reengagement":
+		stages = []stageCfg{
+			{threshold: 1 * time.Minute, message: "Hey {{name}}, just checking in — are you interested in increasing sales this month?"},
+		}
+	default:
+		return false
+	}
+
+	if stage >= len(stages) {
+		return true
+	}
+
+	target := stages[stage]
+	if inactivity < target.threshold {
+		return true
+	}
+
+	account, err := p.app.resolveWhatsAppAccount(contact.OrganizationID, contact.WhatsAppAccount)
+	if err != nil {
+		p.app.Log.Error("Failed to resolve WhatsApp account for system follow-up", "error", err, "contact_id", contact.ID)
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err = p.app.SendOutgoingMessage(ctx, OutgoingMessageRequest{
+		Account: account,
+		Contact: &contact,
+		Type:    models.MessageTypeText,
+		Content: target.message,
+	}, SLASendOptions())
+	if err != nil {
+		p.app.Log.Error("Failed to send system follow-up", "error", err, "contact_id", contact.ID, "stage", stage)
+		return true
+	}
+
+	metadata := contact.Metadata
+	if metadata == nil {
+		metadata = models.JSONB{}
+	}
+	metadata["system_sequence_stage"] = stage + 1
+	metadata["system_sequence_last_followup_at"] = time.Now().UTC().Format(time.RFC3339)
+
+	if err := p.app.DB.Model(&models.Contact{}).
+		Where("id = ?", contact.ID).
+		Update("metadata", metadata).Error; err != nil {
+		p.app.Log.Error("Failed to update system sequence stage", "error", err, "contact_id", contact.ID)
+		return true
+	}
+
+	// Keep local copy in sync in case this loop logic is reused.
+	contact.Metadata = metadata
+	if b, err := json.Marshal(metadata); err == nil {
+		p.app.Log.Debug("System follow-up stage advanced", "contact_id", contact.ID, "stage", stage+1, "metadata", string(b))
+	}
+
+	return true
 }
 
 // sendChatbotReminder sends a reminder message to an inactive client during chatbot conversation
@@ -618,10 +721,31 @@ func (a *App) UpdateContactChatbotMessage(contactID uuid.UUID) {
 
 // ClearContactChatbotTracking clears chatbot tracking when client replies or is transferred
 func (a *App) ClearContactChatbotTracking(contactID uuid.UUID) {
+	var contact models.Contact
+	if err := a.DB.Select("id", "metadata").Where("id = ?", contactID).First(&contact).Error; err != nil {
+		a.DB.Model(&models.Contact{}).
+			Where("id = ?", contactID).
+			Updates(map[string]interface{}{
+				"chatbot_last_message_at": nil,
+				"chatbot_reminder_sent":   false,
+			})
+		return
+	}
+
+	metadata := contact.Metadata
+	if metadata == nil {
+		metadata = models.JSONB{}
+	}
+	delete(metadata, "system_sequence")
+	delete(metadata, "system_sequence_stage")
+	delete(metadata, "system_sequence_started_at")
+	delete(metadata, "system_sequence_last_followup_at")
+
 	a.DB.Model(&models.Contact{}).
 		Where("id = ?", contactID).
 		Updates(map[string]interface{}{
 			"chatbot_last_message_at": nil,
 			"chatbot_reminder_sent":   false,
+			"metadata":                metadata,
 		})
 }

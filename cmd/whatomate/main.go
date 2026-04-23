@@ -17,6 +17,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/middleware"
 	"github.com/shridarpatil/whatomate/internal/queue"
+	"github.com/shridarpatil/whatomate/internal/seeds"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/shridarpatil/whatomate/internal/worker"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -148,6 +149,18 @@ func runServer(args []string) {
 		if err := database.RunMigrationWithProgress(db, &cfg.DefaultAdmin); err != nil {
 			lo.Fatal("Migration failed", "error", err)
 		}
+	}
+
+	// Ensure built-in default chatbot flows exist for all orgs.
+	// This is idempotent and safe to run on every startup.
+	if err := seeds.EnsureDefaultChatbotFlows(db, lo); err != nil {
+		lo.Fatal("Failed to seed default chatbot flows", "error", err)
+	}
+
+	// One-time safe normalization for legacy step naming in existing flows.
+	// Also idempotent; only applies on known legacy patterns.
+	if err := seeds.NormalizeLegacyFlowStepNames(db, lo); err != nil {
+		lo.Fatal("Failed to normalize legacy flow step names", "error", err)
 	}
 
 	// Connect to Redis

@@ -63,7 +63,11 @@ async function fetchFlows() {
       limit: pageSize
     })
     const data = (response.data as any).data || response.data
-    flows.value = data.flows || []
+    const rawFlows = Array.isArray(data.flows) ? data.flows : []
+    flows.value = rawFlows.map((flow: any) => ({
+      ...flow,
+      id: flow.id || flow.ID || ''
+    }))
     totalItems.value = data.total ?? flows.value.length
   } catch (error) {
     console.error('Failed to load flows:', error)
@@ -91,7 +95,16 @@ function createFlow() {
 }
 
 function editFlow(flow: ChatbotFlow) {
-  router.push(`/chatbot/flows/${flow.id}/edit`)
+  const id = flow?.id
+  if (!id) {
+    toast.error(t('common.failedLoad', { resource: t('resources.flow') }))
+    return
+  }
+
+  router.push({
+    name: 'chatbot-flow-edit',
+    params: { id }
+  })
 }
 
 async function toggleFlow(flow: ChatbotFlow) {
@@ -199,10 +212,10 @@ async function confirmDeleteFlow() {
                 </template>
                 <template #cell-actions="{ item: flow }">
                   <div class="flex items-center justify-end gap-1">
-                    <Button variant="ghost" size="icon" class="h-8 w-8" @click="editFlow(flow)">
+                    <Button variant="ghost" size="icon" class="h-8 w-8" @click.stop="editFlow(flow)">
                       <Pencil class="h-4 w-4" />
                     </Button>
-                    <Button variant="ghost" size="icon" class="h-8 w-8 text-destructive" @click="openDeleteDialog(flow)">
+                    <Button variant="ghost" size="icon" class="h-8 w-8 text-destructive" @click.stop="openDeleteDialog(flow)">
                       <Trash2 class="h-4 w-4" />
                     </Button>
                   </div>
